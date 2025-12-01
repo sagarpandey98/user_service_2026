@@ -7,6 +7,4 @@ import lombok.Setter;
 @Getter
 public class SendOtpRequestDto {
     private String identifier;
-    private String otp;
-
 }

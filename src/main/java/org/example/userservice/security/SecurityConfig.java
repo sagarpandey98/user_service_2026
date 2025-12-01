@@ -5,7 +5,6 @@ import com.nimbusds.jose.jwk.RSAKey;
 import com.nimbusds.jose.jwk.source.ImmutableJWKSet;
 import com.nimbusds.jose.jwk.source.JWKSource;
 import com.nimbusds.jose.proc.SecurityContext;
-
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
@@ -31,6 +30,10 @@ import org.springframework.security.oauth2.server.authorization.OAuth2TokenType;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
 import org.springframework.security.web.util.matcher.MediaTypeRequestMatcher;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.web.filter.CorsFilter;
 
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -45,13 +48,12 @@ import java.util.stream.Collectors;
 @EnableWebSecurity
 public class SecurityConfig {
 
-    // Authorization Server Security Configuration
     @Bean
     @Order(1)
     public SecurityFilterChain authorizationServerSecurityFilterChain(HttpSecurity http) throws Exception {
         OAuth2AuthorizationServerConfiguration.applyDefaultSecurity(http);
         http.getConfigurer(OAuth2AuthorizationServerConfigurer.class)
-                .oidc(Customizer.withDefaults()); // Enable OpenID Connect 1.0
+                .oidc(Customizer.withDefaults());
 
         http
                 .exceptionHandling(exceptions -> exceptions
@@ -66,23 +68,26 @@ public class SecurityConfig {
         return http.build();
     }
 
-    // API Security Configuration for DCC and others
     @Bean
     @Order(2)
     public SecurityFilterChain defaultSecurityFilterChain(HttpSecurity http) throws Exception {
         http
+                .cors(Customizer.withDefaults())
                 .authorizeHttpRequests(authorize -> authorize
-                        .requestMatchers(HttpMethod.POST, "/dcc/token", "/dcc/token/otp").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/dcc/token", "/dcc/signup", "/dcc/sendotp", "/dcc/verify-otp").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/dcc/profile").authenticated()
                         .anyRequest().authenticated()
                 )
-                .csrf(csrf -> csrf.ignoringRequestMatchers("/dcc/token", "/dcc/token/otp"))
-                .httpBasic(Customizer.withDefaults()) // Optional: for client credential style requests
-                .formLogin().disable(); // Disable Spring login page for API usage
+                .csrf(csrf -> csrf
+                        .ignoringRequestMatchers("/dcc/token", "/dcc/sendotp", "/dcc/verify-otp", "/dcc/signup")
+                )
+                .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
+                .httpBasic(Customizer.withDefaults())
+                .formLogin(form -> form.disable());
 
         return http.build();
     }
 
-    // JWT Key Pair Generator
     private static KeyPair generateRsaKey() {
         try {
             KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
@@ -93,7 +98,6 @@ public class SecurityConfig {
         }
     }
 
-    // JWK Source for JWT signing
     @Bean
     public JWKSource<SecurityContext> jwkSource() {
         KeyPair keyPair = generateRsaKey();
@@ -107,25 +111,21 @@ public class SecurityConfig {
         return new ImmutableJWKSet<>(jwkSet);
     }
 
-    // JWT Encoder
     @Bean
     public JwtEncoder jwtEncoder(JWKSource<SecurityContext> jwkSource) {
         return new NimbusJwtEncoder(jwkSource);
     }
 
-    // JWT Decoder
     @Bean
     public JwtDecoder jwtDecoder(JWKSource<SecurityContext> jwkSource) {
         return OAuth2AuthorizationServerConfiguration.jwtDecoder(jwkSource);
     }
 
-    // Required for issuing JWTs in Authorization Server
     @Bean
     public AuthorizationServerSettings authorizationServerSettings() {
         return AuthorizationServerSettings.builder().build();
     }
 
-    // Customize roles in token claims
     @Bean
     public OAuth2TokenCustomizer<JwtEncodingContext> jwtTokenCustomizer() {
         return context -> {
@@ -139,15 +139,27 @@ public class SecurityConfig {
         };
     }
 
-    // AuthenticationManager Bean for service-layer auth
     @Bean
     public AuthenticationManager authenticationManager(AuthenticationConfiguration authenticationConfiguration) throws Exception {
         return authenticationConfiguration.getAuthenticationManager();
     }
 
-    // Password encoder for UserDetailsService
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder();
+    }
+
+    // Optional: CORS config if called from frontend/JS client
+    @Bean
+    public CorsFilter corsFilter() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowCredentials(true);
+        config.addAllowedOriginPattern("*");
+        config.addAllowedHeader("*");
+        config.addAllowedMethod("*");
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return new CorsFilter(source);
     }
 }

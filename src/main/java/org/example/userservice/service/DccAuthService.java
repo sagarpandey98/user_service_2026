@@ -1,10 +1,13 @@
 package org.example.userservice.service;
 
-import org.example.userservice.dtos.LoginRequestDto;
+import org.example.userservice.Producer.EmailEventProducer;
+import org.example.userservice.dtos.SendEmailEventDto;
 import org.example.userservice.dtos.SendOtpRequestDto;
+import org.example.userservice.dtos.SignUpRequestDto;
+import org.example.userservice.dtos.UserDto;
+import org.example.userservice.exception.OtpException;
 import org.example.userservice.model.User;
 import org.example.userservice.repository.UserRepository;
-import org.example.userservice.security.models.CustomUserDetails;
 import org.example.userservice.utils.EmailPhoneIdentifier;
 import org.example.userservice.utils.OtpGenerator;
 import org.slf4j.Logger;
@@ -13,9 +16,12 @@ import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.oauth2.core.AuthorizationGrantType;
 import org.springframework.security.oauth2.core.OAuth2AccessToken;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtClaimsSet;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
 import org.springframework.security.oauth2.server.authorization.OAuth2Authorization;
@@ -25,9 +31,8 @@ import org.springframework.security.oauth2.server.authorization.client.Registere
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
+import java.time.LocalDateTime;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -37,21 +42,26 @@ public class DccAuthService {
 
     private final AuthenticationManager authenticationManager;
     private final JwtEncoder jwtEncoder;
+    private final JwtDecoder jwtDecoder;
     private final OAuth2AuthorizationService authorizationService;
     private final RegisteredClientRepository registeredClientRepository;
     private final UserRepository userRepository;
+    private final EmailEventProducer emailEventProducer;
 
     public DccAuthService(AuthenticationManager authenticationManager,
                           JwtEncoder jwtEncoder,
+                          JwtDecoder jwtDecoder,
                           OAuth2AuthorizationService authorizationService,
                           RegisteredClientRepository registeredClientRepository,
-                          UserRepository userRepository) {
-
+                          UserRepository userRepository,
+                          EmailEventProducer emailEventProducer) {
         this.authenticationManager = authenticationManager;
         this.jwtEncoder = jwtEncoder;
+        this.jwtDecoder = jwtDecoder;
         this.authorizationService = authorizationService;
         this.registeredClientRepository = registeredClientRepository;
         this.userRepository = userRepository;
+        this.emailEventProducer = emailEventProducer;
     }
 
     public String getToken(String username, String password, String clientId) {
@@ -60,202 +70,200 @@ public class DccAuthService {
                     new UsernamePasswordAuthenticationToken(username, password)
             );
 
-            CustomUserDetails userDetails = (CustomUserDetails) authentication.getPrincipal();
-
-            RegisteredClient registeredClient = registeredClientRepository.findByClientId(clientId);
-            if (registeredClient == null) {
-                log.warn("Client ID not found: {}", clientId);
-                throw new IllegalArgumentException("Invalid client ID: " + clientId);
+            var userDetails = (org.example.userservice.security.models.CustomUserDetails) authentication.getPrincipal();
+            
+            // Fetch the complete user entity to get all required details
+            Optional<User> userOpt = userRepository.findByEmail(username);
+            if (userOpt.isEmpty()) {
+                userOpt = userRepository.findByUsername(username);
             }
-
-            Instant now = Instant.now();
-            long expirySeconds = 3600;
-
+            
+            if (userOpt.isEmpty()) {
+                throw new RuntimeException("User not found");
+            }
+            
+            User user = userOpt.get();
             Set<String> roles = userDetails.getAuthorities().stream()
                     .map(GrantedAuthority::getAuthority)
                     .collect(Collectors.toSet());
 
-            JwtClaimsSet claims = JwtClaimsSet.builder()
-                    .issuer("amoga-auth")
-                    .issuedAt(now)
-                    .expiresAt(now.plusSeconds(expirySeconds))
-                    .subject(userDetails.getUsername())
-                    .claim("name", userDetails.getName())
-                    .claim("roles", roles)
-                    .build();
-
-            String jwt = jwtEncoder.encode(JwtEncoderParameters.from(claims)).getTokenValue();
-
-            if (jwt == null || jwt.isBlank()) {
-                log.error("JWT generation failed for user [{}]", userDetails.getUsername());
-                throw new RuntimeException("Token generation failed");
-            }
-
-            OAuth2AccessToken accessToken = new OAuth2AccessToken(
-                    OAuth2AccessToken.TokenType.BEARER,
-                    jwt,
-                    now,
-                    now.plusSeconds(expirySeconds)
-            );
-
-            OAuth2Authorization authorization = OAuth2Authorization.withRegisteredClient(registeredClient)
-                    .principalName(userDetails.getUsername())
-                    .authorizationGrantType(AuthorizationGrantType.PASSWORD)
-                    .token(accessToken)
-                    .build();
-
-            authorizationService.save(authorization);
-
-            log.info("Token issued successfully for user [{}] and client [{}]", userDetails.getUsername(), clientId);
-
-            return jwt;
+            return issueJwtToken(user, clientId, roles);
 
         } catch (Exception ex) {
-            log.error("Error during token generation for user [{}] and client [{}]: {}", username, clientId, ex.getMessage(), ex);
+            log.error("Token generation error: {}", ex.getMessage(), ex);
             throw new RuntimeException("Authentication or token issuance failed: " + ex.getMessage(), ex);
         }
     }
 
-    // 🔐 OTP login (to be implemented)
-    public String getTokenByOtp(String email, String otp, String clientId) {
-        // TODO: Lookup user by email
-        // TODO: Validate OTP against stored value (DB or Redis)
-        // TODO: Build JWT using same logic as getToken
-        // TODO: Save to authorizationService and return token
-        return null;
-    }
-
-    // 🔍 For manual validation/debug
-    public String testing(String email, String otp, String clientId) {
+    private String issueJwtToken(User user, String clientId, Set<String> roles) {
         RegisteredClient registeredClient = registeredClientRepository.findByClientId(clientId);
         if (registeredClient == null) {
             throw new IllegalArgumentException("Invalid client ID: " + clientId);
         }
-        return registeredClient.getClientId();
-    }
 
+        Instant now = Instant.now();
+        long expirySeconds = 3600;
+
+        JwtClaimsSet claims = JwtClaimsSet.builder()
+                .issuer("http://localhost:8082")
+                .issuedAt(now)
+                .expiresAt(now.plusSeconds(expirySeconds))
+                .claim("id", user.getId().toString()) // UUID as string
+                .claim("username", user.getUsername())
+                .claim("email", user.getEmail()) // Add email to token
+                .claim("name", user.getName())
+                .claim("roles", roles)
+                .claim("client_id", clientId) // Client ID
+                .build();
+
+        String jwt = jwtEncoder.encode(JwtEncoderParameters.from(claims)).getTokenValue();
+
+        OAuth2AccessToken accessToken = new OAuth2AccessToken(
+                OAuth2AccessToken.TokenType.BEARER,
+                jwt,
+                now,
+                now.plusSeconds(expirySeconds)
+        );
+
+        OAuth2Authorization authorization = OAuth2Authorization.withRegisteredClient(registeredClient)
+                .principalName(user.getUsername())
+                .authorizationGrantType(AuthorizationGrantType.CLIENT_CREDENTIALS)
+                .token(accessToken)
+                .build();
+
+        authorizationService.save(authorization);
+        return jwt;
+    }
 
     public String sendOtp(SendOtpRequestDto request) {
         String identifier = request.getIdentifier();
+
         try {
             String identifierType = EmailPhoneIdentifier.identify(identifier);
-            System.out.println("Identifier Type is " + identifierType);
-
-            if (identifierType.equals("0")) {
-                // Call the email OTP service
-                System.out.println("Email OTP service called");
-                Optional<User> userOptional = userRepository.findByEmail(identifier);
-                if (userOptional.isPresent()) {
-                    System.out.println("User Already Exist");
-                } else {
-                    System.out.println("Creating New User");
-                    String OTP = OtpGenerator.generateOtp();
-                    User user = new User();
-                    user.setEmail(identifier);
-                    user.setUsername(identifier);
-                    user.setOtp(OTP);
-                    user.setStatus(UserStatus.UNVERIFIED);
-                    userRepository.save(user);
-
-                    // Define the HTML template
-                    String htmlTemplate = "<!DOCTYPE html>\n" +
-                            "<html>\n" +
-                            "<head>\n" +
-                            "    <meta charset=\"UTF-8\">\n" +
-                            "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n" +
-                            "    <title>Welcome to Activity Tracker</title>\n" +
-                            "    <style>\n" +
-                            "        body {\n" +
-                            "            font-family: Arial, sans-serif;\n" +
-                            "            background-color: #f4f4f4;\n" +
-                            "            margin: 0;\n" +
-                            "            padding: 0;\n" +
-                            "        }\n" +
-                            "        .container {\n" +
-                            "            width: 100%;\n" +
-                            "            max-width: 600px;\n" +
-                            "            margin: 20px auto;\n" +
-                            "            background: #ffffff;\n" +
-                            "            padding: 20px;\n" +
-                            "            border-radius: 10px;\n" +
-                            "            box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.1);\n" +
-                            "        }\n" +
-                            "        .header {\n" +
-                            "            text-align: center;\n" +
-                            "            background: #007BFF;\n" +
-                            "            padding: 20px;\n" +
-                            "            color: #ffffff;\n" +
-                            "            border-radius: 10px 10px 0 0;\n" +
-                            "        }\n" +
-                            "        .content {\n" +
-                            "            padding: 20px;\n" +
-                            "            text-align: center;\n" +
-                            "        }\n" +
-                            "        .otp {\n" +
-                            "            font-size: 24px;\n" +
-                            "            font-weight: bold;\n" +
-                            "            color: #007BFF;\n" +
-                            "            background: #f0f8ff;\n" +
-                            "            display: inline-block;\n" +
-                            "            padding: 10px 20px;\n" +
-                            "            border-radius: 5px;\n" +
-                            "            margin-top: 10px;\n" +
-                            "        }\n" +
-                            "        .footer {\n" +
-                            "            text-align: center;\n" +
-                            "            padding: 10px;\n" +
-                            "            font-size: 12px;\n" +
-                            "            color: #777;\n" +
-                            "        }\n" +
-                            "    </style>\n" +
-                            "</head>\n" +
-                            "<body>\n" +
-                            "    <div class=\"container\">\n" +
-                            "        <div class=\"header\">\n" +
-                            "            <h2>Welcome to Activity Tracker!</h2>\n" +
-                            "        </div>\n" +
-                            "        <div class=\"content\">\n" +
-                            "            <p>Hi there,</p>\n" +
-                            "            <p>Thank you for joining <strong>Activity Tracker</strong>. We are excited to have you on board!</p>\n" +
-                            "            <p>Your OTP for login verification is:</p>\n" +
-                            "            <p class=\"otp\">{OTP}</p>\n" +
-                            "            <p>Please enter this OTP in the app to complete your login.</p>\n" +
-                            "            <p>If you didn't request this, please ignore this email.</p>\n" +
-                            "        </div>\n" +
-                            "        <div class=\"footer\">\n" +
-                            "            <p>&copy; 2025 Activity Tracker. All rights reserved.</p>\n" +
-                            "        </div>\n" +
-                            "    </div>\n" +
-                            "</body>\n" +
-                            "</html>";
-
-                    // Replace the {OTP} placeholder with the actual OTP
-                    String emailBody = htmlTemplate.replace("{OTP}", OTP);
-
-                    SendEmailEventDto sendEmailEventDto = new SendEmailEventDto();
-                    sendEmailEventDto.setTo(identifier);
-                    sendEmailEventDto.setFrom("sagarbvmdelhi@gmail.com");
-                    sendEmailEventDto.setSubject("OTP for Email Verification");
-                    sendEmailEventDto.setBody(emailBody);
-                    emailEventProducer.sendEmailEvent(sendEmailEventDto);
-                }
-            } else if (identifierType.equals("Phone Number")) {
-                // Call the phone OTP service
-                System.out.println("Phone OTP service called");
-                sendOtpToPhone(identifier);
-            } else {
-                throw new OtpException("Invalid Identifier: " + identifier);
+            if (!"0".equals(identifierType)) {
+                throw new UnsupportedOperationException("Only email-based OTP is supported");
             }
 
-        } catch (OtpException e) {
-            // Handle specific OTP exceptions
-            System.err.println("OTP Error: " + e.getMessage());
-            return null; // Or throw a custom response
+            Optional<User> userOptional = userRepository.findByEmail(identifier);
+            String otp = OtpGenerator.generateOtp();
+
+            User user = userOptional.orElseGet(() -> {
+                User newUser = new User();
+                newUser.setName("New User");
+                newUser.setEmail(identifier);
+                newUser.setUsername(identifier);
+                newUser.setHashedPassword("$2a$17$Mjl0gwvuKs9o/2.5bXcL2.O9ZfTwsmBhTnmBwZQTh.KC0HN6Ny/3i"); // Temp
+                return newUser;
+            });
+
+            user.setOtp(otp);
+            user.setOtpGeneratedTime(LocalDateTime.now());
+            user.setOtpVerified(false);
+            userRepository.save(user);
+
+            SendEmailEventDto email = new SendEmailEventDto();
+            email.setTo(identifier);
+            email.setFrom("sagarbvmdelhi@gmail.com");
+            email.setSubject("OTP for Email Verification");
+            email.setBody(otpTemplate(otp));
+
+            emailEventProducer.sendEmailEvent(email);
+            return "OTP sent successfully";
+
+        } catch (UnsupportedOperationException e) {
+            log.warn("Unsupported identifier [{}]: {}", identifier, e.getMessage());
+            throw e;
         } catch (Exception e) {
-            // Handle unexpected exceptions
-            System.err.println("Unexpected error: " + e.getMessage());
-            e.printStackTrace(); // Log full stack trace
-            return null; // Or handle accordingly
+            log.error("Failed to send OTP to [{}]: {}", identifier, e.getMessage(), e);
+            throw new RuntimeException("Failed to send OTP");
+        }
+    }
+
+    public Map<String, Object> verifyOtpAndLogin(String email, String otp, String clientId) {
+        if (email == null || email.trim().isEmpty()) {
+            throw new OtpException("Email must not be empty");
+        }
+
+        if (otp == null || otp.trim().isEmpty()) {
+            throw new OtpException("OTP must not be empty");
+        }
+
+        if (clientId == null || clientId.trim().isEmpty()) {
+            throw new OtpException("Client ID must not be empty");
+        }
+
+        Optional<User> userOpt = userRepository.findByEmail(email);
+        if (userOpt.isEmpty()) {
+            throw new OtpException("User not found");
+        }
+
+        User user = userOpt.get();
+
+        if (!otp.equals(user.getOtp())) {
+            throw new OtpException("Invalid OTP");
+        }
+
+        user.setOtpVerified(true);
+        userRepository.save(user);
+
+        Set<String> roles = new HashSet<>();
+        roles.add("ROLE_USER"); // default role
+
+        String token = issueJwtToken(user, clientId, roles);
+        boolean isSignedUp = user.isSignedUp();
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("isSignedUp", isSignedUp);
+        response.put("token", token);
+        return response;
+    }
+
+    public Map<String, Object> signup(SignUpRequestDto request, String clientId) {
+        Optional<User> optionalUser = userRepository.findByEmail(request.getEmail());
+
+        if (optionalUser.isEmpty()) {
+            throw new RuntimeException("User not found. Please verify your email first.");
+        }
+
+        User user = optionalUser.get();
+
+        if (!user.isOtpVerified()) {
+            throw new RuntimeException("Email is not verified. Please verify OTP first.");
+        }
+
+        BCryptPasswordEncoder encoder = new BCryptPasswordEncoder(17);
+        String hashedPassword = encoder.encode(request.getPassword());
+
+        user.setName(request.getName());
+        user.setSignedUp(true);
+        user.setHashedPassword(hashedPassword);
+        userRepository.save(user);
+
+        String token = getToken(user.getEmail(), request.getPassword(), clientId);
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("token", token);
+        return response;
+    }
+
+    private String otpTemplate(String otp) {
+        return "<html><body><h3>Your OTP for login is: <b>" + otp + "</b></h3></body></html>";
+    }
+
+    public UserDto getUserProfileFromToken(String token) {
+        try {
+            Jwt jwt = jwtDecoder.decode(token);
+            String userId = jwt.getClaimAsString("id");
+
+            Optional<User> userOptional = userRepository.findById(UUID.fromString(userId));
+            if (userOptional.isPresent()) {
+                User user = userOptional.get();
+                return new UserDto(user.getId(), user.getUsername(), user.getEmail(), user.getName());
+            } else {
+                throw new RuntimeException("User not found");
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to decode token or find user: " + e.getMessage(), e);
         }
     }
 }

@@ -1,13 +1,14 @@
 package org.example.userservice.controllers;
 
-import org.example.userservice.dtos.LoginRequestDto;
-import org.example.userservice.dtos.SendOtpRequestDto;
+import org.example.userservice.dtos.*;
+import org.example.userservice.exception.InvalidRequestException;
 import org.example.userservice.service.DccAuthService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
+import java.util.Objects;
 
 @RestController
 @RequestMapping("/dcc")
@@ -20,55 +21,80 @@ public class UserController {
     }
 
     @PostMapping("/sendotp")
-    public ResponseEntity<Map<String, Object>> sendOtp(@RequestBody SendOtpRequestDto loginRequestDto) {
+    public ResponseEntity<GeneralResponseDto> sendOtp(@RequestBody SendOtpRequestDto loginRequestDto) {
         try {
-            dccAuthService.sendOtp(loginRequestDto);
-            return ResponseEntity.ok(Map.of("message", "OTP sent successfully"));
+            String identifier = loginRequestDto.getIdentifier();
+            if (identifier == null || identifier.trim().isEmpty()) {
+                throw new InvalidRequestException("Email is required");
+            }
+
+            String resolution = dccAuthService.sendOtp(loginRequestDto);
+            if (Objects.equals(resolution, "OTP sent successfully")){
+                GeneralResponseDto response = new GeneralResponseDto(true, "OTP sent successfully", null);
+                return ResponseEntity.ok(response);
+            }
+            GeneralResponseDto response = new GeneralResponseDto(false, "Error sending OTP", null);
+            return ResponseEntity.ok(response);
+
+        } catch (InvalidRequestException ex) {
+            GeneralResponseDto errorResponse = new GeneralResponseDto(false, ex.getMessage(), null);
+            return ResponseEntity.badRequest().body(errorResponse);
         } catch (Exception ex) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(Map.of("error", "Failed to send OTP"));
+            GeneralResponseDto errorResponse = new GeneralResponseDto(false, "Failed to send OTP", null);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
         }
     }
 
-    // 🔐 Username + Password login (existing)
-    @PostMapping("/login")
-    public ResponseEntity<Map<String, Object>> login(@RequestBody SendOtpRequestDto loginRequestDto) {
-        try {
-            String jwt = dccAuthService.getToken(
-                    loginRequestDto.getEmail(),
-                    loginRequestDto.getPassword(),
-                    "oidc-client"
-            );
 
-            return ResponseEntity.ok(Map.of(
-                    "access_token", jwt,
-                    "token_type", "Bearer",
-                    "expires_in", 3600
-            ));
-        } catch (Exception ex) {
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                    .body(Map.of("error", "Invalid credentials"));
-        }
-    }
 
-    // 🔐 OTP-based login (new)
-    @PostMapping("/token/otp")
-    public ResponseEntity<Map<String, Object>> loginByOtp(@RequestBody SendOtpRequestDto requestDto) {
+    @PostMapping("/verify-otp")
+    public ResponseEntity<GeneralResponseDto> verifyOtp(@RequestBody VerifyOtpRequestDto requestDto) {
         try {
-            String jwt = dccAuthService.getTokenByOtp(
+            Map<String, Object> response = dccAuthService.verifyOtpAndLogin(
                     requestDto.getEmail(),
                     requestDto.getOtp(),
-                    "your-client-id"
+                    requestDto.getClientId()
             );
-
-            return ResponseEntity.ok(Map.of(
-                    "access_token", jwt,
-                    "token_type", "Bearer",
-                    "expires_in", 3600
-            ));
-        } catch (Exception ex) {
+            return ResponseEntity.ok(GeneralResponseDto.success("OTP verified successfully", response));
+        } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                    .body(Map.of("error", "Invalid OTP or user"));
+                    .body(GeneralResponseDto.error("Invalid OTP or login failed: " + e.getMessage()));
+        }
+    }
+
+
+    @PostMapping("/signup")
+    public ResponseEntity<GeneralResponseDto> signup(@RequestBody SignUpRequestDto request) {
+        try {
+            if (request.getEmail() == null || request.getEmail().isBlank() ||
+                    request.getPassword() == null || request.getPassword().isBlank() ||
+                    request.getName() == null || request.getName().isBlank() ||
+                    request.getClientId() == null || request.getClientId().isBlank()) {
+                throw new InvalidRequestException("All fields (name, email, password, clientId) are required");
+            }
+
+            Map<String, Object> result = dccAuthService.signup(request, request.getClientId());
+            return ResponseEntity.ok(GeneralResponseDto.success("Signup successful", result));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest()
+                    .body(GeneralResponseDto.error("Signup failed: " + e.getMessage()));
+        }
+    }
+
+    @GetMapping("/profile")
+    public ResponseEntity<GeneralResponseDto> getUserProfile(@RequestHeader("Authorization") String authHeader) {
+        try {
+            if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                throw new InvalidRequestException("Authorization header is required with Bearer token");
+            }
+
+            String token = authHeader.substring(7); // Remove "Bearer " prefix
+            UserDto userProfile = dccAuthService.getUserProfileFromToken(token);
+
+            return ResponseEntity.ok(GeneralResponseDto.success("Profile retrieved successfully", userProfile));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(GeneralResponseDto.error("Failed to retrieve profile: " + e.getMessage()));
         }
     }
 }
