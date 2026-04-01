@@ -41,7 +41,7 @@ public class DccAuthService {
 
     private static final Logger log = LoggerFactory.getLogger(DccAuthService.class);
 
-    @Value("${jwt.issuer.url}")
+    @Value("${jwt.issuer.url:http://northstar-user:8082}")
     private String jwtIssuerUrl;
 
     private final AuthenticationManager authenticationManager;
