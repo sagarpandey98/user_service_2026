@@ -21,12 +21,12 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
+import org.springframework.security.oauth2.server.authorization.OAuth2TokenType;
 import org.springframework.security.oauth2.server.authorization.config.annotation.web.configuration.OAuth2AuthorizationServerConfiguration;
 import org.springframework.security.oauth2.server.authorization.config.annotation.web.configurers.OAuth2AuthorizationServerConfigurer;
 import org.springframework.security.oauth2.server.authorization.settings.AuthorizationServerSettings;
 import org.springframework.security.oauth2.server.authorization.token.JwtEncodingContext;
 import org.springframework.security.oauth2.server.authorization.token.OAuth2TokenCustomizer;
-import org.springframework.security.oauth2.server.authorization.OAuth2TokenType;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
 import org.springframework.security.web.util.matcher.MediaTypeRequestMatcher;
@@ -50,13 +50,19 @@ public class SecurityConfig {
     @Bean
     @Order(1)
     public SecurityFilterChain authorizationServerSecurityFilterChain(HttpSecurity http) throws Exception {
-        OAuth2AuthorizationServerConfiguration.applyDefaultSecurity(http);
-        http.getConfigurer(OAuth2AuthorizationServerConfigurer.class)
-                .oidc(Customizer.withDefaults());
+
+        // ✅ FIX: Use configurer manually instead of applyDefaultSecurity
+        // so we can add permitAll() for JWK endpoints before anyRequest()
+        OAuth2AuthorizationServerConfigurer authorizationServerConfigurer =
+                new OAuth2AuthorizationServerConfigurer();
 
         http
-                // ✅ FIX 1: Permit JWK & OIDC discovery endpoints publicly
+                .securityMatcher(authorizationServerConfigurer.getEndpointsMatcher())
+                .with(authorizationServerConfigurer, configurer ->
+                        configurer.oidc(Customizer.withDefaults())
+                )
                 .authorizeHttpRequests(authorize -> authorize
+                        // ✅ Allow JWK & OIDC discovery endpoints publicly
                         .requestMatchers(
                                 "/.well-known/jwks.json",
                                 "/.well-known/openid-configuration",
@@ -96,7 +102,7 @@ public class SecurityConfig {
         return http.build();
     }
 
-    // ✅ FIX 2: RSA key pair as a singleton Bean — prevents key rotation on restart
+    // ✅ FIX: Singleton KeyPair Bean — prevents new keys on every restart
     @Bean
     public KeyPair rsaKeyPair() {
         try {
@@ -143,7 +149,9 @@ public class SecurityConfig {
                         .stream()
                         .map(role -> role.replace("ROLE_", ""))
                         .collect(Collectors.collectingAndThen(Collectors.toSet(), Collections::unmodifiableSet));
-                context.getClaims().claims(claims -> claims.put("roles", roles));
+                context.getClaims().claims(claims -> {
+                    claims.put("roles", roles);
+                });
             }
         };
     }
