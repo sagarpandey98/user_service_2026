@@ -31,7 +31,6 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
 import org.springframework.security.web.util.matcher.MediaTypeRequestMatcher;
 import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 import org.springframework.web.filter.CorsFilter;
 
@@ -56,6 +55,15 @@ public class SecurityConfig {
                 .oidc(Customizer.withDefaults());
 
         http
+                // ✅ FIX 1: Permit JWK & OIDC discovery endpoints publicly
+                .authorizeHttpRequests(authorize -> authorize
+                        .requestMatchers(
+                                "/.well-known/jwks.json",
+                                "/.well-known/openid-configuration",
+                                "/oauth2/jwks"
+                        ).permitAll()
+                        .anyRequest().authenticated()
+                )
                 .exceptionHandling(exceptions -> exceptions
                         .defaultAuthenticationEntryPointFor(
                                 new LoginUrlAuthenticationEntryPoint("/login"),
@@ -88,7 +96,9 @@ public class SecurityConfig {
         return http.build();
     }
 
-    private static KeyPair generateRsaKey() {
+    // ✅ FIX 2: RSA key pair as a singleton Bean — prevents key rotation on restart
+    @Bean
+    public KeyPair rsaKeyPair() {
         try {
             KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
             keyPairGenerator.initialize(2048);
@@ -99,10 +109,9 @@ public class SecurityConfig {
     }
 
     @Bean
-    public JWKSource<SecurityContext> jwkSource() {
-        KeyPair keyPair = generateRsaKey();
-        RSAPublicKey publicKey = (RSAPublicKey) keyPair.getPublic();
-        RSAPrivateKey privateKey = (RSAPrivateKey) keyPair.getPrivate();
+    public JWKSource<SecurityContext> jwkSource(KeyPair rsaKeyPair) {
+        RSAPublicKey publicKey = (RSAPublicKey) rsaKeyPair.getPublic();
+        RSAPrivateKey privateKey = (RSAPrivateKey) rsaKeyPair.getPrivate();
         RSAKey rsaKey = new RSAKey.Builder(publicKey)
                 .privateKey(privateKey)
                 .keyID(UUID.randomUUID().toString())
@@ -149,7 +158,6 @@ public class SecurityConfig {
         return new BCryptPasswordEncoder();
     }
 
-    // Optional: CORS config if called from frontend/JS client
     @Bean
     public CorsFilter corsFilter() {
         CorsConfiguration config = new CorsConfiguration();
